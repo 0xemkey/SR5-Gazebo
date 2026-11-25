@@ -1,0 +1,83 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="dual_sr5_table">
+    <static>true</static>
+    <link name="table_link">
+
+      <!-- Tabletop: 2.70 x 2.30 m, top surface z=0.78 m -->
+      <visual name="tabletop_visual">
+        <pose>0 0 0.72 0 0 0</pose>
+        <geometry>
+          <box><size>2.70 2.30 0.12</size></box>
+        </geometry>
+        <material>
+          <ambient>0.42 0.30 0.20 1</ambient>
+          <diffuse>0.55 0.39 0.26 1</diffuse>
+        </material>
+      </visual>
+      <collision name="tabletop_collision">
+        <pose>0 0 0.72 0 0 0</pose>
+        <geometry>
+          <box><size>2.70 2.30 0.12</size></box>
+        </geometry>
+      </collision>
+
+      <!-- Four legs -->
+      <visual name="leg_fl_visual">
+        <pose>-1.22 -1.02 0.36 0 0 0</pose>
+        <geometry><box><size>0.11 0.11 0.72</size></box></geometry>
+      </visual>
+      <collision name="leg_fl_collision">
+        <pose>-1.22 -1.02 0.36 0 0 0</pose>
+        <geometry><box><size>0.11 0.11 0.72</size></box></geometry>
+      </collision>
+
+      <visual name="leg_fr_visual">
+        <pose>1.22 -1.02 0.36 0 0 0</pose>
+        <geometry><box><size>0.11 0.11 0.72</size></box></geometry>
+      </visual>
+      <collision name="leg_fr_collision">
+        <pose>1.22 -1.02 0.36 0 0 0</pose>
+        <geometry><box><size>0.11 0.11 0.72</size></box></geometry>
+      </collision>
+
+      <visual name="leg_rl_visual">
+        <pose>-1.22 1.02 0.36 0 0 0</pose>
+        <geometry><box><size>0.11 0.11 0.72</size></box></geometry>
+      </visual>
+      <collision name="leg_rl_collision">
+        <pose>-1.22 1.02 0.36 0 0 0</pose>
+        <geometry><box><size>0.11 0.11 0.72</size></box></geometry>
+      </collision>
+
+      <visual name="leg_rr_visual">
+        <pose>1.22 1.02 0.36 0 0 0</pose>
+        <geometry><box><size>0.11 0.11 0.72</size></box></geometry>
+      </visual>
+      <collision name="leg_rr_collision">
+        <pose>1.22 1.02 0.36 0 0 0</pose>
+        <geometry><box><size>0.11 0.11 0.72</size></box></geometry>
+      </collision>
+
+      <!-- Front and rear aprons -->
+      <visual name="front_apron_visual">
+        <pose>0 -1.06 0.64 0 0 0</pose>
+        <geometry><box><size>2.40 0.07 0.14</size></box></geometry>
+      </visual>
+      <collision name="front_apron_collision">
+        <pose>0 -1.06 0.64 0 0 0</pose>
+        <geometry><box><size>2.40 0.07 0.14</size></box></geometry>
+      </collision>
+
+      <visual name="rear_apron_visual">
+        <pose>0 1.06 0.64 0 0 0</pose>
+        <geometry><box><size>2.40 0.07 0.14</size></box></geometry>
+      </visual>
+      <collision name="rear_apron_collision">
+        <pose>0 1.06 0.64 0 0 0</pose>
+        <geometry><box><size>2.40 0.07 0.14</size></box></geometry>
+      </collision>
+
+    </link>
+  </model>
+</sdf>

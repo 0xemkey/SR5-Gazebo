@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""Dual xMate SR5 gamepad Cartesian controller (ROS 2 Humble).
+
+Subscribes: /joy, /left/joint_states, /right/joint_states
+Publishes:  /left/arm_controller/joint_trajectory,
+            /right/arm_controller/joint_trajectory
+
+F710 axes expected from the established pygame mapping:
+  left stick X/Y  = axes[0]/axes[1]
+  right stick X/Y = axes[2]/axes[3]
+Deadman defaults: buttons[4] for left and buttons[5] for right.
+All indices are ROS parameters so the actual sender mapping can be corrected
+without editing the control algorithm.
+"""
+
+import math
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from ament_index_python.packages import get_package_share_directory
+
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rcl_interfaces.msg import SetParametersResult
+from sensor_msgs.msg import Joy, JointState
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+JOINT_NAMES = [f"joint{i}" for i in range(1, 7)]
+
+
+def rot_axis(axis, angle):
+    axis = np.asarray(axis, dtype=float)
+    axis = axis / np.linalg.norm(axis)
+    x, y, z = axis
+    c, s = math.cos(angle), math.sin(angle)
+    C = 1.0 - c
+    return np.array([
+        [x*x*C+c, x*y*C-z*s, x*z*C+y*s],
+        [y*x*C+z*s, y*y*C+c, y*z*C-x*s],
+        [z*x*C-y*s, z*y*C+x*s, z*z*C+c],
+    ])
+
+
+def rpy_matrix(roll, pitch, yaw):
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def origin_transform(element):
+    T = np.eye(4)
+    if element is None:
+        return T
+    xyz = [float(v) for v in element.attrib.get("xyz", "0 0 0").split()]
+    rpy = [float(v) for v in element.attrib.get("rpy", "0 0 0").split()]
+    T[:3, :3] = rpy_matrix(*rpy)
+    T[:3, 3] = xyz
+    return T
+
+
+class UrdfChain:
+    def __init__(self, path):
+        root = ET.parse(path).getroot()
+        by_child = {j.find("child").attrib["link"]: j for j in root.findall("joint")}
+        chain, link = [], "xMateSR5_link6"
+        while link != "xMateSR5_base":
+            if link not in by_child:
+                raise RuntimeError(f"URDF chain broken at {link}")
+            j = by_child[link]
+            chain.append(j)
+            link = j.find("parent").attrib["link"]
+        self.joints = list(reversed(chain))
+        movable = [j.attrib["name"] for j in self.joints if j.attrib.get("type") != "fixed"]
+        if movable != JOINT_NAMES:
+            raise RuntimeError(f"Unexpected joint order in URDF: {movable}")
+        self.limits = []
+        for j in self.joints:
+            if j.attrib.get("type") == "fixed":
+                continue
+            lim = j.find("limit")
+            self.limits.append((
+                float(lim.attrib["lower"]),
+                float(lim.attrib["upper"]),
+                float(lim.attrib.get("velocity", "1.0")),
+            ))
+
+    def jacobian(self, q, base_xyz, base_yaw):
+        T = np.eye(4)
+        T[:3, :3] = rot_axis([0, 0, 1], base_yaw)
+        T[:3, 3] = np.asarray(base_xyz, dtype=float)
+        axes, origins = [], []
+        k = 0
+        for j in self.joints:
+            T = T @ origin_transform(j.find("origin"))
+            if j.attrib.get("type") == "fixed":
+                continue
+            axis_local = np.array(
+                [float(v) for v in j.find("axis").attrib.get("xyz", "1 0 0").split()]
+            )
+            axes.append(T[:3, :3] @ axis_local)
+            origins.append(T[:3, 3].copy())
+            R = np.eye(4)
+            R[:3, :3] = rot_axis(axis_local, q[k])
+            T = T @ R
+            k += 1
+        p = T[:3, 3]
+        J = np.zeros((6, 6))
+        for i, (axis, origin) in enumerate(zip(axes, origins)):
+            J[:3, i] = np.cross(axis, p - origin)
+            J[3:, i] = axis
+        return J, p
+
+
+class Arm:
+    def __init__(self, node, side, base_xyz, base_yaw, urdf):
+        self.node = node
+        self.side = side
+        self.chain = UrdfChain(urdf)
+        self.base_xyz = base_xyz
+        self.base_yaw = base_yaw
+        self.q = None
+        # Accumulated commanded position. Do not rebuild every setpoint from
+        # measured q: the controller is continuously pre-empted by streamed
+        # trajectories, so measured q can lag and otherwise the target stalls.
+        self.command_q = None
+        self.was_active = False
+        self.deadman = False
+        self.axes = (0.0, 0.0)
+        self.last_sent = None
+        self.pub = node.create_publisher(
+            JointTrajectory, f"/{side}/arm_controller/joint_trajectory", 10
+        )
+        node.create_subscription(
+            JointState, f"/{side}/joint_states", self.joint_cb, 10
+        )
+
+    def joint_cb(self, msg):
+        values = dict(zip(msg.name, msg.position))
+        if all(n in values for n in JOINT_NAMES):
+            self.q = np.array([values[n] for n in JOINT_NAMES], dtype=float)
+
+    def send(self, q_target, duration):
+        msg = JointTrajectory()
+        msg.joint_names = JOINT_NAMES
+        point = JointTrajectoryPoint()
+        point.positions = [float(v) for v in q_target]
+        point.time_from_start.sec = int(duration)
+        point.time_from_start.nanosec = int((duration % 1.0) * 1e9)
+        msg.points = [point]
+        self.pub.publish(msg)
+        self.last_sent = np.asarray(q_target, dtype=float)
+
+    def step(self, dt, speed, damping, deadband, max_joint_speed, active):
+        if self.q is None:
+            return "WAIT_JOINT_STATES"
+        x, y = self.axes
+        x = 0.0 if abs(x) < deadband else x
+        y = 0.0 if abs(y) < deadband else y
+        if not active:
+            # Re-sync the command integrator to measured feedback whenever the
+            # deadman is released or the Joy stream times out.
+            self.command_q = self.q.copy()
+            self.was_active = False
+            self.last_sent = None
+            return "DEADMAN_OFF"
+
+        if not self.was_active or self.command_q is None:
+            self.command_q = self.q.copy()
+            self.was_active = True
+
+        # Cartesian velocity command in world XY. Orientation and Z are held.
+        desired = np.array([-x * speed, y * speed, 0.0, 0.0, 0.0, 0.0])
+        if np.linalg.norm(desired[:2]) < 1e-5:
+            return "DEADMAN_ON_ZERO_STICK"
+
+        # Evaluate the Jacobian at the accumulated command, not the lagging
+        # measured state. This keeps streamed setpoints moving forward.
+        J, _ = self.chain.jacobian(self.command_q, self.base_xyz, self.base_yaw)
+        # Scale translational and angular rows to comparable numerical units.
+        # This is a 6D DLS solve, retaining fixed Z and orientation.
+        row_scale = np.diag([1.0, 1.0, 1.0, 0.35, 0.35, 0.35])
+        Js = row_scale @ J
+        vs = row_scale @ desired
+        A = Js @ Js.T + (damping ** 2) * np.eye(6)
+        try:
+            qdot = Js.T @ np.linalg.solve(A, vs)
+        except np.linalg.LinAlgError:
+            return "IK_SINGULAR_SOLVE_FAILED"
+
+        q_next = self.command_q.copy()
+        for i, (lo, hi, vel) in enumerate(self.chain.limits):
+            joint_speed_limit = min(max_joint_speed, vel * 0.25)
+            qdot[i] = np.clip(qdot[i], -joint_speed_limit, joint_speed_limit)
+            q_next[i] = np.clip(
+                self.command_q[i] + qdot[i] * dt,
+                lo + 0.04,
+                hi - 0.04,
+            )
+
+        if np.linalg.norm(q_next - self.command_q) < 1e-7:
+            return "IK_NO_MOTION"
+
+        # Stream a monotonically advancing position target. The 120 ms
+        # horizon gives the trajectory controller time to interpolate between
+        # successive 50 Hz setpoints; command_q advances independently of the
+        # slower physical joint feedback.
+        self.send(q_next, 0.12)
+        self.command_q = q_next
+        return (f"ACTIVE |xy=({desired[0]:+.3f},{desired[1]:+.3f})"
+                f"|qdot={np.linalg.norm(qdot):.4f}"
+                f"|target_step={np.linalg.norm(q_next - self.q):.5f}")
+
+
+class DualSR5GamepadIK(Node):
+    def __init__(self):
+        super().__init__("dual_sr5_gamepad_ik")
+
+        defaults = {
+            "left_x_axis": 0, "left_y_axis": 1,
+            "right_x_axis": 2, "right_y_axis": 3,
+            "left_deadman_button": 4, "right_deadman_button": 5,
+            "max_tcp_speed": 0.05, "damping": 0.08,
+            "deadband": 0.12, "max_joint_speed": 0.25,
+            "joy_timeout": 0.35, "publish_rate": 50.0,
+        }
+        for name, value in defaults.items():
+            self.declare_parameter(name, value)
+        self.add_on_set_parameters_callback(self.validate_parameters)
+
+        urdf_dir = Path(get_package_share_directory("dual_sr5_sim")) / "urdf"
+        self.left = Arm(self, "left", (-0.60, -0.18, 0.78), 0.0,
+                        urdf_dir / "xMateSR5_left.urdf")
+        self.right = Arm(self, "right", (0.60, -0.18, 0.78), 0.0,
+                         urdf_dir / "xMateSR5_right.urdf")
+        self.joy_received = False
+        self.last_joy = self.get_clock().now()
+        self.last_status_log = self.get_clock().now()
+        self.create_subscription(Joy, "/joy", self.joy_cb, 10)
+        rate = float(self.get_parameter("publish_rate").value)
+        self.timer = self.create_timer(1.0 / rate, self.tick)
+        self.get_logger().info(
+            "Dual SR5 IK READY | axes L=(0,1), R=(2,3) | deadman buttons L=4,R=5"
+        )
+
+    def validate_parameters(self, params):
+        for p in params:
+            if p.name.endswith("_axis") or p.name.endswith("_button"):
+                if int(p.value) < 0:
+                    return SetParametersResult(successful=False, reason="Indices must be >= 0")
+        return SetParametersResult(successful=True)
+
+    def joy_cb(self, msg):
+        p = lambda n: int(self.get_parameter(n).value)
+        required_axes = [p("left_x_axis"), p("left_y_axis"),
+                         p("right_x_axis"), p("right_y_axis")]
+        required_buttons = [p("left_deadman_button"), p("right_deadman_button")]
+        if max(required_axes) >= len(msg.axes) or max(required_buttons) >= len(msg.buttons):
+            self.get_logger().warning(
+                f"/joy shape mismatch: axes={len(msg.axes)} buttons={len(msg.buttons)}"
+            )
+            return
+        self.left.axes = (float(msg.axes[required_axes[0]]),
+                          float(msg.axes[required_axes[1]]))
+        self.right.axes = (float(msg.axes[required_axes[2]]),
+                           float(msg.axes[required_axes[3]]))
+        self.left.deadman = bool(msg.buttons[required_buttons[0]])
+        self.right.deadman = bool(msg.buttons[required_buttons[1]])
+        self.joy_received = True
+        self.last_joy = self.get_clock().now()
+
+    def tick(self):
+        now = self.get_clock().now()
+        if not hasattr(self, "last_tick"):
+            self.last_tick = now
+            return
+        dt = max(0.005, min(0.04, (now - self.last_tick).nanoseconds / 1e9))
+        self.last_tick = now
+        age = (now - self.last_joy).nanoseconds / 1e9
+        joy_ok = self.joy_received and age <= float(self.get_parameter("joy_timeout").value)
+        speed = float(self.get_parameter("max_tcp_speed").value)
+        damping = float(self.get_parameter("damping").value)
+        deadband = float(self.get_parameter("deadband").value)
+        max_joint_speed = float(self.get_parameter("max_joint_speed").value)
+
+        left_status = self.left.step(
+            dt, speed, damping, deadband, max_joint_speed,
+            joy_ok and self.left.deadman
+        )
+        right_status = self.right.step(
+            dt, speed, damping, deadband, max_joint_speed,
+            joy_ok and self.right.deadman
+        )
+
+        if (now - self.last_status_log).nanoseconds > 1_000_000_000:
+            self.get_logger().info(
+                f"L: {left_status} | R: {right_status} | joy_age={age:.3f}s"
+            )
+            self.last_status_log = now
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DualSR5GamepadIK()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
