@@ -63,3 +63,10 @@ LB controls the left-arm deadman; RB controls the right-arm deadman.
 
 ## License
 Apache License 2.0. See `LICENSE`.
+
+## Further documentation
+
+- [Installation and build](docs/installation.md)
+- [System architecture](docs/architecture.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Gamepad mapping](teleoperation/docs/gamepad_mapping.md)

@@ -8,3 +8,19 @@ log/
 .env.*
 .vscode/
 .idea/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ROS 2 / colcon build artifacts
+build/
+install/
+log/
+.colcon/
+
+# Temporary editor and backup files
+*.bak
+*.bak_*
+*~
